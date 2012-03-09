@@ -3,6 +3,7 @@ from __future__ import unicode_literals
 
 import os
 import stat
+import gzip
 
 
 class CPIO(object):
@@ -11,117 +12,141 @@ class CPIO(object):
         self.ino_real2fake = None
         self.ino2htuple = None
         self.fakegen = None
+        self.cutlen = None
 
-    def write_headers(self, ino, info, fullpath, zerosize=False):
-        #TODO: hack ./paths
-        cpio_filename = fullpath.encode('utf-8')
-        record = [b'070701']
-        record.extend((b'{0:08x}'.format(i) for i in [
+    def write_file_contents(self, ino, statres, fullpath, zerosize=False):
+
+        if self.cutlen:
+            cpio_filename = fullpath[self.cutlen:].encode('utf-8')
+            if not cpio_filename:
+                cpio_filename = b'.'
+        else:
+            cpio_filename = fullpath.encode('utf-8')
+
+        cpio_filename += b'\x00'
+
+        if stat.S_ISDIR(statres.st_mode):
+            size = 0
+        elif zerosize:
+            size = 0
+        else:
+            size = statres.st_size
+
+        self.outfile.write(b'070701')
+        # writelines will not add newlines. stupid function name
+        self.outfile.writelines((b'{0:08x}'.format(i) for i in [
             ino,
-            info.st_mode, # TODO: need hacks!
-            0, #info.st_uid,
-            0, #info.st_gid,
-            info.st_nlink, # should not be less that references in that CPIO
-            int(info.st_mtime),
-            0 if stat.S_ISDIR(info.st_mode) or zerosize else info.st_size,
+            statres.st_mode,
+            statres.st_uid,
+            statres.st_gid,
+            statres.st_nlink, # should not be less than references in that CPIO
+            int(statres.st_mtime),
+            size,
             0, # devmajor
             0, # devminor
-            (info.st_rdev >> 8) & 0xff,
-            info.st_rdev  & 0xff,
-            len(cpio_filename) + 1, # buggy CPIO documentation is SHIT
+            (statres.st_rdev >> 8) & 0xff,
+            statres.st_rdev & 0xff,
+            len(cpio_filename), # buggy CPIO documentation is SHIT. yes, length with last zero needed
             0, # check
         ]))
-        record.append(cpio_filename)
-        # terminating zerobyte, with aligning to 4
-        record.append(b'\x00' * (1 - ((110 + len(cpio_filename) + 1) % -4)))
-        record = b''.join(record)
-        # CHECK!
-        if len(record) % 4:
-            raise Exception('Internal error 1')
-        self.outfile.write(record)
+        self.outfile.write(cpio_filename)
 
-    def fetch_ino(self, info):
-        identifier = (info.st_dev, info.st_ino)
-        if info.st_ino in self.ino_real2fake:
-            return self.ino_real2fake[identifier]
+        # alignment
+        self.outfile.write(b'\x00' * (-(self.outfile.tell() % -4)))
+
+        if size == 0:
+            return
+
+        # TODO: check if actual file length match in record.
+        # symlink - so, read and write that
+        if stat.S_ISLNK(statres.st_mode):
+            self.outfile.write(os.readlink(fullpath).encode('utf-8'))
+            self.outfile.write(b'\x00' * (-(self.outfile.tell() % -4)))
+            return
+
+        if stat.S_ISREG(statres.st_mode):
+            with open(fullpath, 'rbe') as xxx:
+                while 1:
+                    chunk = xxx.read(65536)
+                    if not chunk:
+                        break
+                    self.outfile.write(chunk)
+            self.outfile.write(b'\x00' * (-(self.outfile.tell() % -4)))
+            return
+
+        raise Exception('Unknown file type with nonzero len')
+
+    def scandirs(self, path):
+        statres = os.lstat(path)
+
+        identifier = (statres.st_dev, statres.st_ino)
+        if identifier in self.ino_real2fake:
+            ino = self.ino_real2fake[identifier]
         else:
             self.fakegen += 1
             self.ino_real2fake[identifier] = self.fakegen
-            return self.fakegen
+            ino = self.fakegen
 
-    def scandirs(self, path):
-        info = os.lstat(path)
-        ino = self.fetch_ino(info)
-
-        if info.st_size != 0 and info.st_nlink != 1 and not stat.S_ISDIR(info.st_mode):
+        if statres.st_size != 0 and statres.st_nlink != 1 and not stat.S_ISDIR(statres.st_mode):
             # non-zero sized hardlinks will be handled later
-            htuple = self.ino2htuple.setdefault(ino, (info, []))
+            htuple = self.ino2htuple.setdefault(ino, (statres, []))
             htuple[1].append(path)
             return
 
-        self.write_file_contents(ino, info, path)
+        self.write_file_contents(ino, statres, path)
 
-        if not stat.S_ISDIR(info.st_mode):
+        if not stat.S_ISDIR(statres.st_mode):
             return
 
         for item in os.listdir(path):
             self.scandirs(os.path.join(path, item))
 
-    def write_file_contents(self, ino, info, fullpath):
-        self.write_headers(ino, info, fullpath)
+    def hardlinks_handle(self):
+        # handle hardlinks
+        for (ino, (statres, fullpaths)) in self.ino2htuple.iteritems():
+            # all fullpaths except last
+            for fullpath in fullpaths[:-1]:
+                self.write_file_contents(ino, statres, fullpath, True)
 
-        if info.st_size == 0 or stat.S_ISDIR(info.st_mode):
-            return
+            # last fullpaths
+            self.write_file_contents(ino, statres, fullpaths[-1])
 
-        # TODO: check if actual file length match in record.
-        # symlink - so, read and write that
-        if stat.S_ISLNK(info.st_mode):
-            data = os.readlink(fullpath).encode('utf-8')
-            self.outfile.write(data)
-            self.outfile.write(b'\x00' * -(len(data) % -4))
-            # CHECK2 !
-            if (len(data) -(len(data) % -4)) % 4:
-                raise Exception('in error 2')
-            return
+    def write_trailer(self):
+        self.outfile.write(b'070701') # magic
+        self.outfile.write(b'00000000' * 11)
+        self.outfile.write(b'0000000b') # file name length
+        self.outfile.write(b'00000000') # check field
+        self.outfile.write(b'TRAILER!!!\x00\x00\x00\x00') #filename and padding
 
-        if stat.S_ISREG(info.st_mode):
-            dlen = 0
-            with open(fullpath, 'rbe') as xxx:
-                while 1:
-                    chunk = xxx.read(4096)
-                    if not chunk:
-                        break
-                    self.outfile.write(chunk)
-                    dlen += len(chunk)
-            self.outfile.write(b'\x00' * -(dlen % -4))
-            if (dlen - (dlen % -4)) % 4:
-                raise Exception('in error 3')
-            return
+    # TODO: allow dst to be already opened file
+    def create(self, src, dst):
+        '''
+        src may be string (as path name) or iterable of ones
+        dst is the destination filename, like 'dst.cpio.gz'
 
-        raise Exception('Unknown file type with nonzero len')
-
-    def dddd(self, path):
-        self.outfile = open('/tmp/qwe.cpio', 'wbe')
+        This function will create cpio.gz (NEW format)
+        '''
+        self.outfile = gzip.open(dst, 'wbe', 9)
         try:
             self.ino_real2fake = dict()
             self.ino2htuple = dict()
             self.fakegen = 0
-            self.scandirs(path)
-            # handle hardlinks
-            for (ino, (info, fullpaths)) in self.ino2htuple.iteritems():
-                # all fullpaths except last
-                for fullpath in fullpaths[:-1]:
-                    self.write_headers(ino, info, fullpath, True)
-                # last fullpaths
-                fullpath = fullpaths[-1]
-                self.write_file_contents(ino, info, fullpath)
 
-            self.outfile.write(b'070701') # magic
-            self.outfile.write(b'00000000' * 11)
-            self.outfile.write(b'0000000b') # file name length
-            self.outfile.write(b'00000000') # check field
-            self.outfile.write(b'TRAILER!!!\x00\x00\x00\x00') #filename and padding
+            if isinstance(src, basestring):
+                self.cutlen = len(src)
+                self.scandirs(src)
+            else:
+                self.cutlen = None
+                for i in src:
+                    self.scandirs(i)
+            self.hardlinks_handle()
+            self.write_trailer()
+
+        except:
+            os.path.unlink(self.outfile.name)
+            raise
         finally:
+            self.cutlen = None
             self.fakegen = None
             self.ino2htuple = None
             self.ino_real2fake = None
@@ -129,5 +154,3 @@ class CPIO(object):
             self.outfile = None
 
 
-
-CPIO().dddd('.')
