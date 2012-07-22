@@ -133,7 +133,7 @@ class CPIO(object):
             self.fakegen = 0
 
             if isinstance(src, basestring):
-                self.cutlen = len(src)
+                self.cutlen = len(src) + 1
                 self.scandirs(src)
             else:
                 self.cutlen = None
