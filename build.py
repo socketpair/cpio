@@ -13,7 +13,8 @@ import cpio
 
 def main():
     os.chdir('test')
-    cpio.CPIO().create(['.'], '../qweq2.cpio.gz')
+    with open ('../qweq2.cpio.gz', 'wbe') as f:
+        cpio.create('.', f)
 
 if __name__ == '__main__':
     main()
