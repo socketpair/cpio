@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -x
+
+for i in /bin /sbin /usr/bin /usr/sbin; do
+    busybox mkdir -p "$i"
+done
+
+for i in `busybox --list-full`; do
+    busybox ln /bin/busybox "$i"
+done
+
+exec /bin/sh

@@ -1,0 +1,22 @@
+#!/usr/bin/python
+# coding: utf-8
+
+import os
+
+def main():
+    coredirs = [
+        '/bin',
+        '/sbin',
+        '/usr/bin',
+        '/usr/sbin',
+    ]
+
+    for i in coredirs:
+        if not os.path.exists(i):
+            print i
+            os.makedirs(i)
+
+    print type('here')
+
+if __name__ == '__main__':
+    main()
