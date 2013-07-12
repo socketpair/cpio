@@ -81,6 +81,10 @@ class CPIO(object):
         if size > 0xffffffff:
             raise CPIOException('Too big file size for this CPIO format', statres.st_size)
 
+        if size != statres.st_size:
+            log.warning('Replacing size of stat struct %d => %d', statres.st_size, size)
+            statres._replace(st_size=size)
+
         if isinstance(fullpath, unicode):
             cpio_filename = fullpath.encode(self.output_encoding)
         else:
@@ -93,7 +97,7 @@ class CPIO(object):
         elif not cpio_filename.startswith(b'/'):
             cpio_filename = b'/' + cpio_filename
 
-        self._write_header(statres, cpio_filename, size)
+        self._write_header(statres, cpio_filename)
 
         if stat.S_ISDIR(statres.st_mode):
             return
@@ -116,12 +120,12 @@ class CPIO(object):
                     self._outwrite(chunk)
                     size -= len(chunk)
             if size:
-                raise CPIOException('File was truncated while reading', fullpath)
+                raise CPIOException('File was changed while reading', fullpath)
             return
 
         raise CPIOException('Unknown file type', statres.st_mode)
 
-    def _write_header(self, statres, cpio_filename, size):
+    def _write_header(self, statres, cpio_filename):
         cpio_filename += b'\x00'
 
         fields = [
@@ -131,7 +135,7 @@ class CPIO(object):
             statres.st_gid,
             statres.st_nlink,
             statres.st_mtime,
-            size,
+            statres.st_size,
             os.major(statres.st_dev),
             os.minor(statres.st_dev),
             os.major(statres.st_rdev),
@@ -187,6 +191,11 @@ class CPIO(object):
         else:
             nlink = 1
 
+        if stat.S_ISREG(statres.st_mode) or stat.S_ISLNK(statres.st_mode):
+            size = statres.st_size
+        else:
+            size = 0
+
         newstatres = MyStat(
             st_uid=uid,
             st_gid=gid,
@@ -196,7 +205,7 @@ class CPIO(object):
             st_nlink=nlink,
             st_dev=0,
             st_rdev=statres.st_rdev,
-            st_size=statres.st_size,
+            st_size=size,
         )
 
         if (statres.st_nlink == 1) or stat.S_ISDIR(statres.st_mode):
@@ -231,7 +240,7 @@ class CPIO(object):
             st_rdev=0,
             st_size=0,
         )
-        self._write_header(statres, b'TRAILER!!!', 0)
+        self._write_header(statres, b'TRAILER!!!')
         # for really buggy cpio unpacker implementations...
         self._align()
 
