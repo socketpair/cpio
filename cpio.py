@@ -248,6 +248,9 @@ class CPIO(object):
         return self
 
     def __exit__(self, *exc_info):
+        self.finalize()
+
+    def finalize(self):
         self._hardlinks_handle()
         self._write_trailer()
 
