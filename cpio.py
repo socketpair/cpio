@@ -22,6 +22,8 @@ MyStat = namedtuple('MyStat', [
     'st_dev',
     'st_rdev',
     'st_size',
+    'symlink_path', # bytes (!)
+    'host_filename', # unicode or bytes
 ])
 
 
@@ -57,21 +59,14 @@ class CPIO(object):
         if offset:
             self._outwrite(b'\x00' * offset)
 
-    def _write_file_contents(self, statres, fullpath):
+    def _write_file_contents(self, statres, cpio_filename):
         """
         :type statres: MyStat
-        :type fullpath: str or unicode
+        :type cpio_filename: bytes
         """
 
-        symlink_path = None
         if stat.S_ISLNK(statres.st_mode):
-            symlink_path = os.readlink(fullpath)
-            if isinstance(symlink_path, unicode):
-                symlink_path = symlink_path.encode(self.output_encoding)
-            else:
-                # validate filename
-                symlink_path = symlink_path.decode(self.input_encoding).encode(self.output_encoding)
-            size = len(symlink_path)
+            size = len(statres.symlink_path)
         elif stat.S_ISREG(statres.st_mode):
             size = statres.st_size
         else:
@@ -85,34 +80,24 @@ class CPIO(object):
             log.warning('Replacing size of stat struct %d => %d', statres.st_size, size)
             statres._replace(st_size=size)
 
-        if isinstance(fullpath, unicode):
-            cpio_filename = fullpath.encode(self.output_encoding)
-        else:
-            # validate filename
-            cpio_filename = fullpath.decode(self.input_encoding).encode(self.output_encoding)
-
-        # TODO: fullpath == '.' (!)
-        if cpio_filename.startswith(b'./'):
-            cpio_filename = cpio_filename[1:]
-        elif not cpio_filename.startswith(b'/'):
-            cpio_filename = b'/' + cpio_filename
+        if cpio_filename == b'TRAILER!!!':
+            raise CPIOException('Attempt to pass reserved filename', cpio_filename)
 
         self._write_header(statres, cpio_filename)
 
-        if stat.S_ISDIR(statres.st_mode):
+        # hardlinks, empty files and directories fall here
+        if not size:
             return
 
         if stat.S_ISLNK(statres.st_mode):
             self._align()
-            self._outwrite(symlink_path)
+            self._outwrite(statres.symlink_path)
             return
 
         #TODO: splice
         if stat.S_ISREG(statres.st_mode):
-            if not size:
-                return
             self._align()
-            with open(fullpath, 'rbe') as xxx:
+            with open(statres.host_filename, 'rbe') as xxx:
                 while size:
                     chunk = xxx.read(65536)
                     if not chunk:
@@ -120,7 +105,7 @@ class CPIO(object):
                     self._outwrite(chunk)
                     size -= len(chunk)
             if size:
-                raise CPIOException('File was changed while reading', fullpath)
+                raise CPIOException('File was changed while reading', statres.host_filename)
             return
 
         raise CPIOException('Unknown file type', statres.st_mode)
@@ -164,10 +149,15 @@ class CPIO(object):
             self._outwrite(b'{0:08x}'.format(i))
         self._outwrite(cpio_filename)
 
-    def inject_path(self, path):
+    def inject_path(self, path, root='/'):
         """
         :type path: basestring
         """
+        # TODO: check that:
+        # new file will not be written by existing symlink
+        # archive contains all needed dirs
+        # is not duplicate of another file in archive
+
         statres = os.lstat(path)
 
         ino = self.ino_real2fake[(statres.st_dev, statres.st_ino)]
@@ -189,12 +179,39 @@ class CPIO(object):
         if stat.S_ISDIR(statres.st_mode):
             nlink = 2
         else:
-            nlink = 1
+            nlink = statres.st_nlink
 
         if stat.S_ISREG(statres.st_mode) or stat.S_ISLNK(statres.st_mode):
             size = statres.st_size
         else:
             size = 0
+
+        if stat.S_ISLNK(statres.st_mode):
+            symlink_path = os.readlink(path)
+            if not isinstance(symlink_path, unicode):
+                symlink_path = symlink_path.decode(self.input_encoding)
+            symlink_path = symlink_path.encode(self.output_encoding)
+        else:
+            symlink_path = None
+
+        nnn = os.path.normpath(root)
+        if nnn != root:
+            raise ValueError('Please normalize path before passing it to CPIO %r vs %r', nnn, root)
+
+        if not path.startswith(root):
+            raise ValueError('Invalid root or path value', path, root)
+
+        cpio_filename = path[len(root):]
+        if not cpio_filename:
+            cpio_filename = u'.'
+
+        if not isinstance(cpio_filename, unicode):
+            cpio_filename = cpio_filename.decode(self.input_encoding)
+
+        if cpio_filename.startswith(u'/'):
+            cpio_filename = cpio_filename[1:]
+
+        cpio_filename = cpio_filename.encode(self.output_encoding)
 
         newstatres = MyStat(
             st_uid=uid,
@@ -206,27 +223,39 @@ class CPIO(object):
             st_dev=0,
             st_rdev=statres.st_rdev,
             st_size=size,
+            symlink_path=symlink_path,
+            host_filename=path,
         )
 
-        if (statres.st_nlink == 1) or stat.S_ISDIR(statres.st_mode):
-            self._write_file_contents(newstatres, path)
+        # TODO: check if OS lie about hardlink count
+        if (nlink == 1) or stat.S_ISDIR(statres.st_mode):
+            self._write_file_contents(newstatres, cpio_filename)
         else:
             # hardlinks will be handled later, as we can not know if it is intermediate item or last
+            log.debug('Detected potential hardlink %r (%r)', path, cpio_filename)
             htuple = self.ino2htuple.setdefault(ino, (newstatres, []))
-            htuple[1].append(path)
+            htuple[1].append(cpio_filename)
 
     def _hardlinks_handle(self):
         # handle hardlinks
         if self.ino2htuple:
             log.debug('Writing hardlinks')
-        for (statres, fullpaths) in self.ino2htuple.itervalues():
-            statres._replace(st_nlink=len(fullpaths))
-            fake_statres = MyStat(statres[:])
+        for (statres, cpio_filenames) in self.ino2htuple.itervalues():
+            lnk_count = len(cpio_filenames)
+            if lnk_count > statres.st_nlink:
+                raise CPIOException('Found more hardlinks (%r) than host FS reports (%r). See %r', cpio_filenames,
+                                    statres.st_nlink, statres.host_filename)
+            if lnk_count < statres.st_nlink:
+                log.info('Found fewer hardlinks: %r than host FS reports (%r). See %r', cpio_filenames,
+                         statres.st_nlink, statres.host_filename)
+            statres._replace(st_nlink=lnk_count)
+            fake_statres = MyStat(*statres)
             fake_statres._replace(st_size=0)
-            # all fullpaths except last
-            for fullpath in fullpaths[:-1]:
-                self._write_file_contents(fake_statres, fullpath)
-            self._write_file_contents(statres, fullpaths[-1])
+
+            last_cpio_filename = cpio_filenames.pop()
+            for cpio_filename in cpio_filenames:
+                self._write_file_contents(fake_statres, cpio_filename)
+            self._write_file_contents(statres, last_cpio_filename)
 
     def _write_trailer(self):
         statres = MyStat(
@@ -239,6 +268,8 @@ class CPIO(object):
             st_dev=0,
             st_rdev=0,
             st_size=0,
+            symlink_path=None,
+            host_filename=None,
         )
         self._write_header(statres, b'TRAILER!!!')
         # for really buggy cpio unpacker implementations...
@@ -254,45 +285,25 @@ class CPIO(object):
         self._hardlinks_handle()
         self._write_trailer()
 
+    def superinject(self, src):
+        def _walkhandler(error):
+            raise error
 
-def _walkhandler(error):
-    raise error
+        if isinstance(src, basestring):
+            src = [src]
 
+        for root in src:
+            if os.path.islink(root):
+                raise ValueError('Attempt to super-inject by symlink', root)
+            if not os.path.isdir(root):
+                raise ValueError('Attempt to super-inject by non-dir', root)
+            self.inject_path(root, root)
+            for (prefix, dirs, files) in os.walk(root, onerror=_walkhandler):
+                for item in itertools.chain(files, dirs):
+                    self.inject_path(os.path.join(prefix, item), root)
 
-def _create(cpio_obj, src):
-    if isinstance(src, basestring):
-        src = [src]
-
-    for i in src:
-        cpio_obj.inject_path(i)
-        if not os.path.isdir(i):
-            continue
-        if os.path.islink(i):
-            continue
-        for (root, dirs, files) in os.walk(i, onerror=_walkhandler):
-            for i in itertools.chain(files, dirs):
-                cpio_obj.inject_path(os.path.join(root, i))
-
-
-def create(src, dst, gzip=None, ingzipname=None):
-    '''
-    src may be string (as path name) or iterable of ones
-    dst is the destination file object
-
-    This function will create cpio.gz (NEW format)
-    '''
-
-    if gzip is None:
-        name = dst.name
-        gzip = name.endswith('.gz')
-        ingzipname = name[:-3]
-
-    if not gzip:
-        with CPIO(dst) as cpio_obj:
-            return _create(cpio_obj, src)
-
-    from gzip import GzipFile
-
-    with GzipFile(ingzipname, 'wbe', 9, dst) as dst:
-        with CPIO(dst) as cpio_obj:
-            return _create(cpio_obj, src)
+#from gzip import GzipFile
+#
+#with GzipFile('test.gz', 'wbe', 9, dst) as dst:
+#    with CPIO(dst) as cpio:
+#        cpio.superibject(src, True)
